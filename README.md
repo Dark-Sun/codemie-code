@@ -46,8 +46,8 @@ codemie setup
 # 2. Check system health
 codemie doctor
 
-# 3. Install an external agent (e.g., Claude Code)
-codemie install claude
+# 3. Install an external agent (e.g., Claude Code - latest supported version)
+codemie install claude --supported
 
 # 4. Use the installed agent
 codemie-claude "Review my API code"
@@ -64,7 +64,7 @@ codemie --task "Generate unit tests"
 ```bash
 npx @codemieai/code setup
 npx @codemieai/code doctor
-npx @codemieai/code install claude
+npx @codemieai/code install claude --supported
 # Note: Agent shortcuts require global installation
 ```
 
@@ -137,12 +137,13 @@ You can also install and use external agents like Claude Code and Gemini.
 
 **Available Agents:**
 - **Claude Code** (`codemie-claude`) - Anthropic's official CLI with advanced code understanding
+- **Claude Code ACP** (`codemie-claude-acp`) - Claude Code for IDE integration via ACP protocol (Zed, JetBrains, Emacs)
 - **Gemini CLI** (`codemie-gemini`) - Google's Gemini for coding tasks
 - **OpenCode** (`codemie-opencode`) - Open-source AI coding assistant with session analytics
 
 ```bash
-# Install an agent
-codemie install claude
+# Install an agent (latest supported version)
+codemie install claude --supported
 
 # Use the agent
 codemie-claude "Review my API code"
@@ -154,7 +155,28 @@ codemie-gemini "Implement a REST API"
 # Install OpenCode
 codemie install opencode
 codemie-opencode "Generate unit tests for my service"
+
+# Install Claude Code ACP (for IDE integration)
+codemie install claude-acp
+# Configure in your IDE (see docs/AGENTS.md for details)
 ```
+
+**Version Management:**
+
+CodeMie manages agent versions to ensure compatibility. For Claude Code:
+
+```bash
+# Install latest supported version (recommended)
+codemie install claude --supported
+
+# Install specific version
+codemie install claude 2.1.22
+
+# Install latest available version
+codemie install claude
+```
+
+Auto-updates are automatically disabled to maintain version control. CodeMie notifies you when running a different version than supported.
 
 For more detailed information on the available agents, see the [Agents Documentation](docs/AGENTS.md).
 
@@ -164,11 +186,11 @@ When using Claude Code (`codemie-claude`), you get access to powerful built-in c
 
 **Project Documentation:**
 ```bash
-# Generate AI-optimized docs (CLAUDE.md + guides). Can be added optional info as well
-/codemie-init
+# Generate AI-optimized docs (CLAUDE.md + guides). Can be added optional details after command as well
+/codemie:codemie-init
 
-# Generate project-specific subagents. Can be added optional info as well
-/codemie-subagents
+# Generate project-specific subagents. Can be added optional details after command as well
+/codemie:codemie-subagents
 ```
 
 **Memory Management:**
@@ -209,6 +231,7 @@ codemie setup            # Interactive configuration wizard
 codemie list             # List all available agents
 codemie install <agent>  # Install an agent
 codemie update <agent>   # Update installed agents
+codemie self-update      # Update CodeMie CLI itself
 codemie profile          # Manage provider profiles
 codemie analytics        # View usage analytics (sessions, tokens, costs, tools)
 codemie workflow <cmd>   # Manage CI/CD workflows
@@ -244,4 +267,3 @@ This project is licensed under the Apache-2.0 License.
 - [GitHub Repository](https://github.com/codemie-ai/codemie-code)
 - [Issue Tracker](https://github.com/codemie-ai/codemie-code/issues)
 - [NPM Package](https://www.npmjs.com/package/@codemieai/code)
-
