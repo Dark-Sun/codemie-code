@@ -186,6 +186,11 @@ export class ClaudeSessionAdapter implements SessionAdapter {
     // Build tool results map (tool_use_id → isError) for status tracking
     const toolResultsMap = new Map<string, boolean>();
 
+    // Track processed message IDs to avoid duplicate token counting
+    // Claude streaming creates multiple JSONL entries (thinking, text, tool_use)
+    // for the same API response, each with identical usage data
+    const processedMessageIds = new Set<string>();
+
     // First pass: collect tool results
     for (const msg of messages) {
       if (msg.message?.content && Array.isArray(msg.message.content)) {
@@ -201,13 +206,16 @@ export class ClaudeSessionAdapter implements SessionAdapter {
 
     // Second pass: aggregate metrics
     for (const msg of messages) {
-      // Extract token usage
-      if (msg.message?.usage) {
-        const usage = msg.message.usage;
-        inputTokens += usage.input_tokens || 0;
-        outputTokens += usage.output_tokens || 0;
-        cacheReadTokens += usage.cache_read_input_tokens || 0;
-        cacheWriteTokens += usage.cache_creation_input_tokens || 0;
+      // Extract token usage (deduplicate by message.id - streaming chunks share same id)
+      if (msg.message?.usage && msg.message?.id) {
+        if (!processedMessageIds.has(msg.message.id)) {
+          processedMessageIds.add(msg.message.id);
+          const usage = msg.message.usage;
+          inputTokens += usage.input_tokens || 0;
+          outputTokens += usage.output_tokens || 0;
+          cacheReadTokens += usage.cache_read_input_tokens || 0;
+          cacheWriteTokens += usage.cache_creation_input_tokens || 0;
+        }
       }
 
       // Extract tool usage and status
@@ -320,6 +328,117 @@ export class ClaudeSessionAdapter implements SessionAdapter {
   }
 
   /**
+   * Apply processor sync updates to session metadata.
+   * Merges updates from all processors into session state.
+   */
+  private async applySyncUpdates(
+    sessionId: string,
+    results: Array<{ metadata?: any }>
+  ): Promise<void> {
+    try {
+      const { SessionStore } = await import('../../core/session/SessionStore.js');
+      const sessionStore = new SessionStore();
+      const session = await sessionStore.loadSession(sessionId);
+
+      if (!session) {
+        logger.warn(`[claude-adapter] Session not found for sync updates: ${sessionId}`);
+        return;
+      }
+
+      for (const result of results) {
+        if (!result.metadata?.syncUpdates) continue;
+
+        const { syncUpdates } = result.metadata;
+
+        // Apply metrics updates
+        if (syncUpdates.metrics) {
+          session.sync ??= {};
+          session.sync.metrics ??= {
+            lastProcessedTimestamp: Date.now(),
+            processedRecordIds: [],
+            totalDeltas: 0,
+            totalSynced: 0,
+            totalFailed: 0
+          };
+
+          // Merge processedRecordIds (deduplicate)
+          if (syncUpdates.metrics.processedRecordIds) {
+            const existing = new Set(session.sync.metrics.processedRecordIds || []);
+            for (const id of syncUpdates.metrics.processedRecordIds) {
+              existing.add(id);
+            }
+            session.sync.metrics.processedRecordIds = Array.from(existing);
+          }
+
+          // Update counters (increment, don't overwrite)
+          if (syncUpdates.metrics.totalDeltas !== undefined) {
+            session.sync.metrics.totalDeltas = (session.sync.metrics.totalDeltas || 0) + syncUpdates.metrics.totalDeltas;
+          }
+          if (syncUpdates.metrics.totalSynced !== undefined) {
+            session.sync.metrics.totalSynced = (session.sync.metrics.totalSynced || 0) + syncUpdates.metrics.totalSynced;
+          }
+          if (syncUpdates.metrics.totalFailed !== undefined) {
+            session.sync.metrics.totalFailed = (session.sync.metrics.totalFailed || 0) + syncUpdates.metrics.totalFailed;
+          }
+          if (syncUpdates.metrics.lastProcessedTimestamp !== undefined) {
+            session.sync.metrics.lastProcessedTimestamp = syncUpdates.metrics.lastProcessedTimestamp;
+          }
+        }
+
+        // Apply conversations updates
+        if (syncUpdates.conversations) {
+          session.sync ??= {};
+          session.sync.conversations ??= {
+            lastSyncedMessageUuid: undefined,
+            lastSyncedHistoryIndex: -1,
+            totalMessagesSynced: 0,
+            totalSyncAttempts: 0
+          };
+
+          // Update conversation tracking (latest wins)
+          if (syncUpdates.conversations.lastSyncedMessageUuid !== undefined) {
+            session.sync.conversations.lastSyncedMessageUuid =
+              syncUpdates.conversations.lastSyncedMessageUuid;
+          }
+          if (syncUpdates.conversations.lastSyncedHistoryIndex !== undefined) {
+            session.sync.conversations.lastSyncedHistoryIndex =
+              Math.max(
+                session.sync.conversations.lastSyncedHistoryIndex ?? -1,
+                syncUpdates.conversations.lastSyncedHistoryIndex
+              );
+          }
+          if (syncUpdates.conversations.conversationId !== undefined) {
+            session.sync.conversations.conversationId = syncUpdates.conversations.conversationId;
+          }
+          if (syncUpdates.conversations.lastSyncAt !== undefined) {
+            session.sync.conversations.lastSyncAt = syncUpdates.conversations.lastSyncAt;
+          }
+
+          // Update counters (increment, don't overwrite)
+          if (syncUpdates.conversations.totalMessagesSynced !== undefined) {
+            session.sync.conversations.totalMessagesSynced =
+              (session.sync.conversations.totalMessagesSynced || 0) +
+              syncUpdates.conversations.totalMessagesSynced;
+          }
+          if (syncUpdates.conversations.totalSyncAttempts !== undefined) {
+            session.sync.conversations.totalSyncAttempts =
+              (session.sync.conversations.totalSyncAttempts || 0) +
+              syncUpdates.conversations.totalSyncAttempts;
+          }
+        }
+      }
+
+      // Persist session ONCE after all updates applied
+      await sessionStore.saveSession(session);
+
+      logger.debug(`[claude-adapter] Session persisted after all processors completed`);
+    } catch (error) {
+      logger.error(`[claude-adapter] Failed to apply sync updates:`, error);
+      throw error;
+    }
+  }
+
+  /**
    * Process session file with all registered processors.
    * Reads file once, passes ParsedSession to all processors.
    *
@@ -339,13 +458,14 @@ export class ClaudeSessionAdapter implements SessionAdapter {
       // 1. Parse session file once (includes sub-agent discovery)
       const parsedSession = await this.parseSessionFile(filePath, sessionId);
 
-      // 2. Execute processors in priority order
+      // 2. Execute processors in priority order and collect results
       const processorResults: Record<string, {
         success: boolean;
         message?: string;
         recordsProcessed?: number;
       }> = {};
       const failedProcessors: string[] = [];
+      const allResults: Array<{ metadata?: any }> = [];
       let totalRecords = 0;
 
       for (const processor of this.processors) {
@@ -360,6 +480,7 @@ export class ClaudeSessionAdapter implements SessionAdapter {
 
           // Execute processor
           const result = await processor.process(parsedSession, context);
+          allResults.push(result);
 
           processorResults[processor.name] = {
             success: result.success,
@@ -392,7 +513,10 @@ export class ClaudeSessionAdapter implements SessionAdapter {
         }
       }
 
-      // 3. Aggregate results
+      // 3. Apply all sync updates and persist session ONCE
+      await this.applySyncUpdates(sessionId, allResults);
+
+      // 4. Aggregate results
       const result: AggregatedResult = {
         success: failedProcessors.length === 0,
         processors: processorResults,
